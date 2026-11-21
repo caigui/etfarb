@@ -80,6 +80,22 @@ def _resolve_unified_db_path():
         cand = find_sibling_path(*parts)
         if cand:
             return cand
+    # ③-b 同级目录名大小写/连字符变体（2026-11-13 补）：
+    #   实际部署常把目录 clone 成 `lofarb-master`（GitHub 默认名），而上一步只认
+    #   `LOFarb`，于是直接 `python app.py` 必然 FileNotFoundError —— 而
+    #   start_dashboard.bat 里手写了 ARB_MASTER_DB 所以看不出来，换人/换机就踩。
+    #   这里按「祖先目录下任意 lofarb* 子目录」兜一次，大小写不敏感。
+    for base in _ancestor_dirs():
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        for nm in names:
+            if not nm.lower().startswith("lofarb"):
+                continue
+            cand = os.path.join(base, nm, "database", "arb_master.db")
+            if os.path.exists(cand):
+                return cand
     if os.name != "nt":
         arm = "/home/ubuntu/arbtest/database/arb_master.db"
         if os.path.exists(arm):
@@ -211,6 +227,21 @@ def ensure_schema():
             conn.execute(sql)
         except sqlite3.OperationalError:
             pass  # 列已存在
+
+    # ---- 关注池 watch_pool（WATCH 看板 /「我的关注」星标；[AI-2026-11-02] 补初始化） ----
+    # 代码里只有 SELECT（core/etf_iopv_quote.pool()：WATCH 市场过滤、watched 标志、
+    # tag/sort/note 元数据）与 DELETE（backend /api/watch/<code> 取消关注），
+    # 行数据靠人工/外部喂入 —— 但此前**从未建表**，全新库首个请求即
+    # "no such table: watch_pool"，WATCH 看板与取消关注直接 500。
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS watch_pool (
+            code     TEXT PRIMARY KEY,   -- 6 位基金代码（TEXT 保留前导 0；/api/watch 校验 6 位数字）
+            tag      TEXT,               -- 标签（前端「标签」列，空则显示「关注」）
+            sort     INTEGER DEFAULT 999,-- 排序权重（小在前；缺省 999 沉底，与 pool() 缺省一致）
+            note     TEXT,               -- 备注（前端 title 悬浮展示）
+            added_at TIMESTAMP DEFAULT (datetime('now','localtime'))
+        )"""
+    )
     conn.commit()
     conn.close()
 

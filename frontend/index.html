@@ -585,10 +585,77 @@ function closePcf() { document.getElementById('pcfModal').classList.add('hidden'
 document.getElementById('pcfModal').addEventListener('click', function (e) { if (e.target === this) closePcf(); });
 
 // ============ 历史记录弹窗（点「静态估值」列弹出；列/配色/分页对齐 LOF 套利程序） ============
-var HIST = { code: null, name: '', kind: '', rows: [], page: 1, size: 10, profile: {} };
+var HIST = { code: null, name: '', kind: '', rows: [], page: 1, size: 10, profile: {}, desc: '', algo: {} };
 function hpc(v) {                       // 涨红跌绿（对齐 arbTest priceColor）
   if (v === null || v === undefined || isNaN(v)) return '#999';
   return v > 0 ? '#dc2626' : (v < 0 ? '#16a34a' : '#374151');
+}
+// 债券实时/静态估值口径说明（2026-11-14：511360 换成独立 PCF 逐券法；
+//   511520 改为「纯计算」——不冻结官方净值、不做残差拟合）
+function bondStaticTip(r) {
+  if (r.bond_method === 'pending')
+    return r.code + '【已收录·实时估值待接入】：该标的已加入现金管理模块，但估值算法尚未接入，本行「实时估值/溢价」留空。';
+  // 2026-11-17 晚：9 只现金管理「交易所信用债 ETF」——中证指数日涨跌锚定。
+  if (String(r.bond_method || '').indexOf('csi_index') === 0 ||
+      String(r.bond_method || '').indexOf('peers_implied') === 0 ||
+      r.bond_method === 'cash_bond_anchor_only' ||
+      r.bond_method === 'carry_only' ||
+      r.bond_method === 'cash_bond_unavailable')
+    return r.code + '【中证指数日涨跌锚定·纯计算】：est = nav(T-1) × (1 + 跟踪指数当日涨跌%)。'
+      + '指数取中证指数官网官方发布值（950245 上证基准做市公司债 / 932158 中证科技创新公司债 / '
+      + '932160 中证AAA科技创新公司债）。'
+      + '🔴 不叠加票息 —— 中证债券指数是财富指数口径，日涨跌本身已含当日票息，'
+      + '叠一次等于重复计息（实测单向高估 1.0~1.9bp）。'
+      + '精度（19 个交易日，vs 累计净值涨跌）：|误差| 中位 0.3~0.8bp、max 3.6bp。'
+      + '盘中中证指数尚未发布，退用同指数兄弟 ETF 的盘中涨跌中位数粗估'
+      + '（P90 误差 25~36bp，含折溢价日间噪音），收盘后自动切回指数精确口径；'
+      + '551030 无同指数 ETF，用 932158 代理（两指数日涨跌差 |中位| 0.00bp、max 1.00bp）。'
+      + '分红日按累计净值剔除派现复算，不把除权当暴跌。'
+      + '不走逐券的原因：这批成份券是交易所信用债 —— 交易所行情恒为 0.000（无连续成交）、'
+      + 'CFETS 估值表只覆盖政金债/国债（对 313 只成份券命中 0%）、'
+      + '货币网是银行间市场（名称命中 0 条且方向相反）。';
+  // 2026-11-17 晚（请求 H）：可转债 ETF —— 转债指数日涨跌 × 滚动 beta。
+  //   与上面信用债 ETF 的关键区别：可转债在交易所**有连续竞价成交**，但 PCF 只给
+  //   数量不给替代金额（实测 qty×价格 无法还原权重，511380/511180 的比例分别是
+  //   10.414/10.781，不是常数）⇒ 逐券反而差 19~26bp，故仍走指数法。
+  if (String(r.bond_method || '').indexOf('cb_') === 0) {
+    var _is380 = (r.code === '511380');
+    var _m = r.bond_method;
+    var _base = r.code + '【可转债ETF·转债指数×滚动beta·纯计算】：est = nav(T-1) × (1 + beta × 指数当日涨跌%)。'
+      + '跟踪指数：511380 → 中证可转债及可交换债券指数(931078)，511180 → 上证可转换债券指数(000139)。'
+      + '🔴 不叠加票息 —— 可转债利息已含在转债全价里，没有独立的 carry 项。'
+      + '🔴 beta 必须**逐日滚动回归**（近40个交易日、日净值涨跌对日指数涨跌做 OLS），'
+      + '不能用一个固定常数：511180 的 beta 在 4 个月内从 0.686 单调漂到 0.817'
+      + '（只持85只、兴业/上银/通22/重银等银行转债占比高且在变化），'
+      + '拿最终值回算早期历史属于前视偏差。';
+    if (_m === 'cb_live_index_intraday')
+      return _base + '【当前为盘中口径】中证 perf 接口只在收盘后发布，盘中用上证转债指数'
+        + '(sh000139) 实时行情 × beta 粗估（该指数与两只标的的相关性 r=0.995/0.989，可支撑盘中）。'
+        + '收盘后自动切回标的自身跟踪指数的官方发布值。'
+        + (_is380 ? '实测样本外 |误差| 中位 1.2bp、max 4.4bp —— 可当精确估值用。'
+                 : '⚠️ 本只精度有限：实测样本外 |误差| 中位 7.3bp、max 42.4bp —— 只能当参考，不可当精确净值。');
+    if (_m === 'cb_index_daily')
+      return _base + '【当前为收盘后口径】用标的自身跟踪指数的当日官方涨跌。'
+        + (_is380 ? '实测样本外 |误差| 中位 1.2bp、max 4.4bp —— 可当精确估值用。'
+                 : '⚠️ 本只精度有限：实测样本外 |误差| 中位 7.3bp、max 42.4bp —— 只能当参考，不可当精确净值。');
+    if (_m === 'cb_anchor_only')
+      return _base + '【锚点口径】目标日不晚于最新净值日，无新行情可叠加，直接显示官方净值'
+        + '（不重复计息、不做拟合）。';
+    if (_m === 'cb_unavailable')
+      return _base + '🔴【取数失败·刻意留空】指数与实时行情都取不到。'
+        + '**绝不拿最新净值冒充实时估值** —— 可转债日波动常达 1~3%，'
+        + '冒充会把溢价/折价算成 0，比留空远更误导。';
+    return _base;
+  }
+  if (r.code === '511360')
+    return '511360【方法二·PCF逐券篮子，独立估值方法】：海富通官网 PCF「替代金额/(数量×10)」= 每只成份券全价（含应计）；逐券 ΔP = −修正久期 × Δy（成交bp中位数×0.9），叠加逐券票息；按三季报经济结构折算：债券82.80%（吃价格效应+票息）+ 买入返售17.16%（FR007生息、不吃价格效应）+ 其他0.04%。篮子恒等式校验 (Σ替代金额+预估现金)/最小申赎单位 = 官方净值。按模型计算，不做拟合。';
+  if (r.code === '511090' || r.code === '511130' || r.code === '511220' ||
+      String(r.bond_method || '').indexOf('sse_pcf') >= 0)
+    return '511090/511130/511220【上交所PCF逐券估值·纯计算】：上交所申赎清单公告只给数量不给替代金额（TradingDay=T 公告用 T-1 官方净值作锚点），逐券价格由货币网现券成交补齐。30年国债ETF：成份券（25/26超长特别国债）名称映射取 Δy×组合修正久期，成交稀疏时用 30年国债期货TL 涨跌兜底；城投债ETF：成份为交易所券（无免费逐券行情），用银行间城投/中票 Δy 中位数×期限作同向代理 + 组合票息。行情不新于净值日时显示锚点净值（无新增行情不重复叠加），不拟合。回测 2026-11-13：511220 误差 +0.4bp。';
+  if (r.code === '511520' || String(r.bond_method || '').indexOf('pcf') === 0)
+    return '511520【PCF逐券法·纯计算，不做拟合】：以富国官网 PCF 清单为准，「替代金额」= 每只成份券全价（含应计）。逐券价格优先级：① 当日有成交 → 用 PCF 全价 + 货币网真实成交净价的跨日变动（零推算）；② 当日无成交额 → 用国开10Y活跃利率债的 Δy × 该券修正久期（平行移动假设）推算。逐券反推票息计 carry；债券99.52% + 一日逆回购0.48%（GC001实时利率），以最新官方净值为锚。盘后/周末无新增行情时价格效应归零，仍按逐券票息+逆回购计息算出估值，不直接显示官方净值、不做校准拟合。';
+  return r.bond_method ? '债券口径：前一日净值 + 票息 + 方向项。'
+                       : 'nav(D-1) × (1 + 0.95 × 指数D涨幅)。';
 }
 function hNum(v, d) { return (v === null || v === undefined || isNaN(v)) ? null : Number(v).toFixed(d === undefined ? 4 : d); }
 function hValChg(val, chg, d) {         // arbTest renderValWithChg：主值 + 右侧小字涨跌
@@ -609,12 +676,14 @@ function hWeekendLabel(dateStr, code) { // arbTest：511360 标周一、其余�
   return '';
 }
 function showStaticVal(code, name) {
-  HIST = { code: code, name: name || '', kind: '', rows: [], page: 1, size: Number(document.getElementById('histSizeSel').value) || 10, profile: {} };
+  HIST = { code: code, name: name || '', kind: '', rows: [], page: 1,
+           size: Number(document.getElementById('histSizeSel').value) || 10,
+           profile: {}, desc: '', algo: {} };
   document.getElementById('staticTitle').textContent = '[历史记录] ' + code + (name ? ' - ' + name : '');
   document.getElementById('histInfo').innerHTML = '';
   document.getElementById('staticDesc').textContent = '';
   document.getElementById('staticHead').innerHTML = '';
-  document.getElementById('histBody').innerHTML = '<tr><td colspan="12" style="padding:16px; color:#94a3b8;">加载中…</td></tr>';
+  document.getElementById('histBody').innerHTML = '<tr><td colspan="16" style="padding:16px; color:#94a3b8;">加载中…</td></tr>';
   document.getElementById('staticModal').classList.remove('hidden');
   histFetch();
 }
@@ -622,16 +691,19 @@ function histFetch() {
   fetch('/api/staticval/history/' + HIST.code)
     .then(function (r) { return r.json(); })
     .then(function (d) {
-      if (d.error) { document.getElementById('histBody').innerHTML = '<tr><td colspan="12" style="padding:16px; color:#ef4444;">' + esc(d.error) + '</td></tr>'; return; }
+      if (d.error) { document.getElementById('histBody').innerHTML = '<tr><td colspan="16" style="padding:16px; color:#ef4444;">' + esc(d.error) + '</td></tr>'; return; }
       HIST.kind = d.kind || 'lof'; HIST.rows = d.rows || []; HIST.profile = d.profile || {};
+      HIST.desc = d.desc || ''; HIST.algo = d.algo || {};
       HIST.page = 1;
       if (d.name) HIST.name = d.name;   // 接口有名称就补上（原先要求本地已有名，导致只传 code 时标题永远无名）
       document.getElementById('staticTitle').textContent = '[历史记录] ' + HIST.code + (HIST.name ? ' - ' + HIST.name : '');
+      // 2026-11-14：后端下发的估值算法说明（此前元素一直空着）
+      document.getElementById('staticDesc').textContent = HIST.desc;
       renderHistInfo();
       renderHist();
     })
     .catch(function () {
-      document.getElementById('histBody').innerHTML = '<tr><td colspan="12" style="padding:16px; color:#ef4444;">加载失败</td></tr>';
+      document.getElementById('histBody').innerHTML = '<tr><td colspan="16" style="padding:16px; color:#ef4444;">加载失败</td></tr>';
     });
 }
 function renderHistInfo() {
@@ -642,7 +714,16 @@ function renderHistInfo() {
     h += '<div><strong>申购费率：</strong> ' + esc(p.sub_fee || '-') + '</div>';
     h += '<div><strong>赎回费率：</strong> ' + esc(p.redeem_fee || '-') + '</div>';
   } else {
-    h += '<div><strong>类型：</strong> 现金管理（债券/货币型，无汇率与指数权重口径）</div>';
+    h += '<div><strong>类型：</strong> 债券/现金管理（债券/货币型，无汇率与指数权重口径）</div>';
+    var a = HIST.algo || {};
+    if (a.name) {
+      h += '<div><strong>估值算法：</strong> ' + esc(a.name) +
+           (a.version && a.version !== '—' ? ' <span style="color:#94a3b8;">(' + esc(a.version) + ')</span>' : '') +
+           (a.id ? ' <span style="color:#94a3b8; font-size:11px;">' + esc(a.id) + '</span>' : '') +
+           '</div>';
+    } else if (p.val_algo) {
+      h += '<div><strong>估值算法：</strong> ' + esc(p.val_algo) + '</div>';
+    }
   }
   document.getElementById('histInfo').innerHTML = h;
 }
@@ -684,9 +765,27 @@ function renderHist() {
         if (r.idx_pct === null || r.idx_pct === undefined) return '-';
         return '<span style="color:' + hpc(r.idx_pct) + '; font-weight:500;">' + r.idx_pct.toFixed(3) + '%</span>'; } });
     }
-    if (code === '511520') {             // 511520 专属：国债期货 + 涨幅
-      cols.push({ t: '期货', k: 'futures_close', w: 82, al: 'center', f: function (r) { return hNum(r.futures_close, 3) === null ? '-' : '<span>' + hNum(r.futures_close, 3) + '</span>'; } });
-      cols.push({ t: '期货涨幅', k: 'futures_pct', w: 82, al: 'center', f: function (r) {
+    if (code === '511520') {             // 511520 专属：国开10Y活跃利率债 + 涨幅
+      // 2026-11-13：跟踪标的由「10Y国债期货T2612」改为「国开10Y活跃利率债」，
+      //   指数价=活跃券成交净价，涨幅=该券当日净价涨跌幅%（仅作参考，不参与估值）。
+      //   ⚠️ 数据来源必须如实标注（dir_src 由后端下发）——国开10Y活跃券的历史行情
+      //      没有免费公开源，只有本地有 PCF 快照的日子（pcf_real）才是**真实活跃券价**；
+      //      其余日子是活跃10Y国债期货（futures_proxy）或国债指数（treasury_proxy）
+      //      的**同向代理**，数值口径不同，绝不可让人误读成国开10Y真实价格。
+      var _SRC = {
+        cfets_real:      { tag: 'CFETS估值', ttl: '该日静态估值由 CFETS 逐券估值全价的两日变动算出（与实时 cfets 路径同算法）；本列无活跃券价时留空。' },
+        pcf_real:        { tag: '',      ttl: '来自本地 PCF 快照记录的当日国开10Y活跃券真实成交净价（含当日Δy）。' },
+        futures_proxy:   { tag: '期货代理', ttl: '该日无 PCF 快照，用活跃10Y国债期货(如T2612)收盘价作国开10Y的【同向代理】——两者跟踪同一利率方向，但价格点位口径不同，不可直接对比。' },
+        treasury_proxy:  { tag: '国债代理', ttl: '该日既无 PCF 快照也无期货行情，退化为国债指数000012 作【同向代理】。' },
+        none:            { tag: '无数据',  ttl: '该日无任何可用方向数据。' }
+      };
+      cols.push({ t: '国开10Y活跃券', k: 'futures_close', w: 118, al: 'center', f: function (r) {
+        var v = hNum(r.futures_close, 3);
+        if (v === null) return '-';
+        var s = _SRC[r.dir_src] || _SRC.none;
+        var tag = s.tag ? '<span style="font-size:10px; color:#b45309; background:#fef3c7; border-radius:3px; padding:0 3px; margin-left:3px;">' + s.tag + '</span>' : '';
+        return '<span title="' + esc(s.ttl) + '">' + v + tag + '</span>'; } });
+      cols.push({ t: '活跃券涨幅', k: 'futures_pct', w: 92, al: 'center', ttl: '该日国开10Y活跃券的净价涨跌幅%。\n2026-11-16 修复：Δy 改用货币网 bpNum（带符号；原 bp 恒为正，方向会全错），修正久期改用 CFETS 官方值（原按发行年估算，会放大跌幅约 14%）。', f: function (r) {
         if (r.futures_pct === null || r.futures_pct === undefined) return '-';
         return '<span style="color:' + hpc(r.futures_pct) + '; font-weight:500;">' + r.futures_pct.toFixed(3) + '%</span>'; } });
     }
@@ -697,9 +796,22 @@ function renderHist() {
       return '<span style="color:#999;">-</span>';
     var v = r.static_val - r.nav;
     return '<span style="color:' + hpc(v) + '; font-weight:bold;">' + v.toFixed(4) + '</span>'; } });
-  cols.push({ t: '误差率', k: 'val_error_rate', w: 80, al: 'center', f: function (r) {
+      cols.push({ t: '误差率', k: 'val_error_rate', w: 80, al: 'center', f: function (r) {
     if (r.val_error_rate === null || r.val_error_rate === undefined || isNaN(r.val_error_rate)) return '-';
     return '<span style="color:' + hpc(r.val_error_rate) + '; font-weight:500;">' + r.val_error_rate.toFixed(3) + '%</span>'; } });
+  if (isCash) {
+    // 2026-11-14：记录每行「实际使用的估值算法」——511360 / 511520 更新后口径可逐日追溯
+    cols.push({ t: '估值算法', k: 'algo_id', w: 168, al: 'center', f: function (r) {
+      var n = r.algo_name || '-';
+      var ttl = [r.algo_id ? '算法ID: ' + r.algo_id : '',
+                 r.algo_mode ? '口径: ' + r.algo_mode : '',
+                 r.algo_src ? '数据源: ' + r.algo_src : '',
+                 r.algo_note || '',
+                 (HIST.algo && HIST.algo.entry) ? '入口: ' + HIST.algo.entry : '']
+                .filter(Boolean).join('\n');
+      return '<span style="color:#475569; font-size:11px; cursor:help;" title="' + esc(ttl) + '">' +
+             esc(n) + '</span>'; } });
+  }
   if (!isCash) {
     cols.push({ t: 'T-1 估值溢价', k: 'static_premium', w: 88, al: 'center', f: function (r) {
       if (r.static_premium === null || r.static_premium === undefined) return '-';
@@ -786,10 +898,11 @@ var NAV_TABS = [
   { k: 'E', t: '欧美' },
   { k: 'A', t: '亚洲' },
   { k: 'L', t: '国内LOF' },
-  { k: 'C', t: '现金管理' }
+  { k: 'B', t: '债券' },       // 2026-11-17：16 只债券 ETF 从现金管理拆出（jsl_market=B）
+  { k: 'C', t: '现金管理' }    // 仅剩 511880/511990 两只货币 ETF
 ];
 var currentView = 'main';     // 'main' | 'market'
-var MV = 'A';                 // 当前市场：A 亚洲 / E 欧美 / G 黄金原油 / F 商品期货 / L 境内LOF / C 现金管理
+var MV = 'A';                 // 当前市场：A 亚洲 / E 欧美 / G 黄金原油 / F 商品期货 / L 境内LOF / B 债券 / C 现金管理
 var marketData = {};          // {A: payload, A|LOF: payload, ...}
 var mktSort = { key: 'amount_wan', desc: true };
 var mktCompact = true;
@@ -999,7 +1112,7 @@ var COL_BASE = [
         // woody 行 ETFarb 不出静态估值（数据以 arbTest 为准），仅显占位
         return '<span class="muted" title="该基金已在 arbTest（woody）覆盖，静态估值请到 arbTest 查看">—</span>';
       }
-      var tip = r.bond_method ? '债券口径：前一日净值 + 票息 + 方向项。' : 'nav(D-1) × (1 + 0.95 × 指数D涨幅)。';
+      var tip = bondStaticTip(r);
       var link = (v === null || v === undefined) ? body
         : '<span class="col-static-link" title="' + tip + ' 点击查看历史核对页">' + body + '</span>';
       return link; } },
@@ -1035,7 +1148,7 @@ var COL_LOF_BASE = [
   { k: 'turnover', t: '换手率', cls: 'turnover-cell', ttl: '成交量(手) ÷ 份额(万份)。与集思录/LOF套利程序同口径。', f: function (v, r) {
       var t = (r.volume_lot && r.pre_share && r.pre_share > 0) ? r.volume_lot / r.pre_share : null;
       return (t === null || isNaN(t)) ? '<span class="muted">—</span>' : pf(t); } },
-  { k: 'iopv', t: '实时估值', ttl: 'nav(D) × (1 + 0.95 × 指数实时涨幅)。仓位统一 95%（东哥 2026-09-18 拍板，arbTest unified_valuation 矩阵式单组件特例）。', f: function (v) { return nf(v); } },
+  { k: 'iopv', t: '实时估值', ttl: 'nav(D) × (1 + 0.95 × 指数实时涨幅)。仓位统一 95%（东哥 2026-09-18 拍板，arbTest unified_valuation 矩阵式单组件特例）。\n⚠️ 例外：债券三只（511880/511360/511520）不用本公式——511880=日均增长法；511360=海富通PCF逐券篮子（独立方法，债券82.80%/逆回购17.16%按FR007）；511520=富国PCF逐券法（CFETS逐券估值/曲线Δy + 逐券carry + 99.52/0.48仓位，纯计算不拟合，详见单元格悬浮提示）。', f: function (v) { return nf(v); } },
   { k: 'iopv_prem', t: '实时溢价', ttl: '(现价 − 实时估值) ÷ 实时估值。\n🔴 点本列表头 = 按本列数值排序（升/降切换）；无数据的行恒排在最末。', sv: function (r) { return shownRtPremBp(r); }, f: function (v) { return (v === null || v === undefined) ? '<span class="muted">—</span>' : '<span class="' + px(v) + '">' + pf(v) + '</span>'; } },
   { k: 'nav', t: '基金净值', ttl: '最新已公布净值（腾讯 jj[5]，与集思录同口径）。', f: function (v) { return nf(v); } },
   { k: 'nav_date', t: '净值日期', ttl: '净值所属日期（腾讯 jj[8]）。', f: function (v) { return v || '—'; } },
@@ -1050,13 +1163,13 @@ var COL_LOF_BASE = [
         // woody 行 ETFarb 不出静态估值（数据以 arbTest 为准），仅显占位
         return '<span class="muted" title="该基金已在 arbTest（woody）覆盖，静态估值请到 arbTest 查看">—</span>';
       }
-      var tip = r.bond_method ? '债券口径：前一日净值 + 票息 + 方向项。' : 'nav(D-1) × (1 + 0.95 × 指数D涨幅)。';
+      var tip = bondStaticTip(r);
       var link = (v === null || v === undefined) ? body
         : '<span class="col-static-link" title="' + tip + ' 点击查看历史核对页">' + body + '</span>';
       return link; } },
   { k: 'static_prem', t: 'T-1 估值溢价', ttl: '(现价 − T-1 静态估值) ÷ T-1 静态估值。', f: function (v) { return (v === null || v === undefined) ? '<span class="muted">—</span>' : '<span class="' + px(v) + '">' + pf(v) + '</span>'; } },
-  { k: 'idx_price', t: '指数价', ttl: '跟踪指数实时点位。', f: function (v) { return (typeof v === 'string') ? '<span style="color:#e0533d;font-weight:600;">' + esc(v) + '</span>' : nf(v, 2); } },
-  { k: 'idx_chg', t: '指数涨幅', ttl: '跟踪指数的实时涨跌幅（实时估值用）。', f: function (v) { return (v === null || v === undefined) ? '<span class="muted">—</span>' : '<span class="' + px(v) + '">' + pf(v) + '</span>'; } },
+  { k: 'idx_price', t: '指数价', ttl: '跟踪指数实时点位。\n⚠️ 例外：511520 的跟踪标的为「国开10Y活跃利率债」（一只具体的券，不是指数），本列显示的是该券当日【成交净价】，不是指数点位，仅作参考、不参与估值。', f: function (v) { return (typeof v === 'string') ? '<span style="color:#e0533d;font-weight:600;">' + esc(v) + '</span>' : nf(v, 2); } },
+  { k: 'idx_chg', t: '指数涨幅', ttl: '跟踪指数的实时涨跌幅（实时估值用）。\n⚠️ 例外：511520 本列是其跟踪活跃券的【净价涨跌幅%】，仅作参考、不参与估值。\n计算：−修正久期 × Δy，其中 Δy 取货币网 bpNum（带符号，2026-11-16 修复：原用 bp，该字段恒为正会丢失方向），修正久期取 CFETS 官方值（原用按发行年估算，会放大跌幅约 14%）。\n⚠️ 注意：这是一只券的涨跌，不是篮子整体。篮子组合久期约 7.55，小于该券的 8.76，且篮内个券离散度很大（实测 17 只 Δy 极差 7.96bp），所以实时估值幅度通常会小于本列，属正常。', f: function (v) { return (v === null || v === undefined) ? '<span class="muted">—</span>' : '<span class="' + px(v) + '">' + pf(v) + '</span>'; } },
   // （F 专属「驱动列」在 renderMarket 动态注入，见 F_DRIVER_COL；COL_LOF_BASE 内不放，
   //   避免 L/C/G 市场误渲染）
   { k: 'index_nm', t: '指数名称', l: 1, f: function (v) { return esc(v || '—'); } },
@@ -1104,7 +1217,8 @@ function switchView(k) {
             : (MV === 'L') ? '国内 LOF'
             : (MV === 'G') ? '黄金原油（商品LOF，数据以 arbTest 为准）'
             : (MV === 'F') ? '商品期货（估值引用 LOFarb，161226 白银 AG0 驱动）'
-            : '现金管理';
+            : (MV === 'B') ? '债券（国债/信用债/科创债/城投债/短融/政金债/可转债 ETF）'
+            : '现金管理（货币 ETF）';
     document.getElementById('mktTitle').textContent = ttl;
     syncTypeChecks();
     var key = MV + '|' + (mktType || '');
@@ -1145,7 +1259,7 @@ function loadMarket(mkt, force) {
 function renderMarket() {
   var d = marketData[MV + '|' + (mktType || '')];
   // 商品期货(F) 与 LOF 用同一套列（都含基金净值/静态估值/溢价等），故并入 isLof
-  var isLof = (MV === 'L' || MV === 'C' || MV === 'G' || MV === 'F');
+  var isLof = (MV === 'L' || MV === 'B' || MV === 'C' || MV === 'G' || MV === 'F');
   // 商品期货(F) 专属「驱动列」：AG0 昨结算价（+ SI 交叉验证）。仅 F 市场注入。
   var F_DRIVER_COL = { k: 'ag0_settlement', t: '驱动<br><span class="col-sub">AG0昨结算</span>', ttl: '上期所白银期货 AG0 上一交易日官方结算价（元/千克）。估值分母，由 LOFarb SSE 推流/新浪 nf_AG0 双源提供，ETFarb 引用不重算。盘中非交易时段实时价丢弃、昨结算价恒显示（东哥要求）。', cls: 'col-driver', f: function (v, r) {
       if (v === null || v === undefined) return '<span class="muted">—</span>';

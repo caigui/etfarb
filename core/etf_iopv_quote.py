@@ -371,7 +371,8 @@ class ETFMarketBoard:
     def pool(self, market=None, fund_type=None, limit=None, min_share=None, codes=None):
         """看板标的：`fund_profile` + 最新份额。按份额降序（规模优先）。
 
-        `market`：'A'=亚洲(ETF+QDII亚洲混合) / 'E'=欧美 / 'L'=国内LOF / 'C'=现金管理
+        `market`：'A'=亚洲(ETF+QDII亚洲混合) / 'E'=欧美 / 'L'=国内LOF
+                  / 'B'=债券(2026-11-17 新增，16 只债券ETF，从 C 拆出) / 'C'=现金管理(仅 2 只货币ETF)
                   / 'G'=黄金原油(商品LOF，arbTest woody 覆盖) / 'WATCH'=关注池（跨市场，按 watch_pool 表过滤，测试看板用）。
         `fund_type`：'ETF' / 'LOF'（前端「显示ETF/显示LOF」复选框用）。
         `min_share`（万份）用于「先做达标的子集」—— 不传即全池。"""
@@ -495,7 +496,7 @@ class ETFMarketBoard:
         返回 `{'ts', 'market', 'rows', 'stats', 'errors'}`。
         每行**必带** `quote_path`（内部消费，前端不渲染）。
 
-        `market`：'A'/'E'/'L'/'C'（见 `pool`）。
+        `market`：'A'/'E'/'L'/'B'/'C'（见 `pool`）。
         `fund_type`：'ETF'/'LOF'（前端「显示ETF/显示LOF」复选框）。
         `force_live=True` 跳过盘后冻结（仅供开发自测 / 调试，生产调用不要传）。
         """
@@ -510,7 +511,7 @@ class ETFMarketBoard:
         #   🔴 仅欧美(E)盘后冻结：其成分含美股(盘后至凌晨4点)/欧股(北京凌晨收)，
         #      盘后仍在波动 ⇒ 自算 IOPV 漂移为假溢价。国内LOF(L)/亚洲(A)成分均北京
         #      白天收盘(港股16:00/A股15:00/日经14:00)，盘后不动，自算溢价即真实收盘值，
-        #      无需冻结；现金管理(C)本就走 bond 通道豁免。market=None(CLI 全市场调试)
+        #      无需冻结；债券(B)/现金管理(C)本就走 bond 通道豁免。market=None(CLI 全市场调试)
         #      保守按冻结处理，避免欧美失保护。
         #   WATCH 关注池跨市场（含欧美成分），盘后同样需冻结保护 ⇒ 与 E 同待遇。
         frozen = (not force_live) and self._is_frozen_mode() \
@@ -541,7 +542,7 @@ class ETFMarketBoard:
         # ---- 0b) LOF 静态估值数据：过期即补（净值 year_all + 指数日K，12h TTL）----
         #   首轮抓取约 10s（41 净值 + ~35 指数K线），之后 12h 内零网络开销。
         lof_profs = [p for p in profs if (p.get("fund_type") or "ETF") == "LOF"
-                     or (p.get("jsl_market") or "") == "C"]
+                     or (p.get("jsl_market") or "") in ("B", "C")]
         if lof_profs:
             try:
                 _sv.ensure_nav_history([p["fund_code"] for p in lof_profs], self.db)
@@ -758,16 +759,67 @@ class ETFMarketBoard:
                        if p.get("idx_code") else None)
                 idx_pct = idx["pct"] if idx else None
                 vm = (p.get("val_method") or "")
-                if vm == "bond":
+                if vm == "pending":
+                    # 🔴 2026-11-17 东哥要求：新增的 9 只现金管理 ETF 先入库、
+                    #   实时估值留空，后续再补算法。
+                    #   必须**显式**标记，不能让它落进下面的 else：
+                    #   else 分支会用 `nav×(1+0.95×指数涨幅)` 算出数来，
+                    #   那是「拿个方向凑一个值」，对债券 ETF 毫无意义，还会被误当成
+                    #   真实时估值。这里直接把 est 置空、给一句可读的原因。
+                    #   接入时只需把 fund_profile.val_method 改成 'bond'
+                    #   并在 BOND_ETF_META 里登记算法入口。
+                    est = None
+                    row["err"] = "实时估值待接入（已收录，估值算法后续补充）"
+                    row["idx_chg"] = None
+                    row["bond_method"] = "pending"
+                elif vm == "bond":
                     # 🔴 债券 ETF 日内估值（移植 arbTest BondETFValuation，东哥 09-18 授权）：
-                    #   511880 日均增长法 / 511360 票息+国债指数000012 / 511520 票息+活跃10Y国债期货。
-                    #   国债指数 000012 走 idx_provider（s_sh000012，已实测），活跃10Y国债期货走模块内新浪抓取（合约按交割月动态）。
+                    #   511880 日均增长法 / 511360 独立方法 PCF逐券篮子
+                    #     （三季报债券82.80%+逆回购17.16%按FR007；2026-11-14 起）/
+                    #   511520 PCF逐券法（CFETS估值/曲线Δy + 逐券carry，纯计算不拟合；
+                    #     跟踪标的参考国开10Y活跃利率债，仅展示不参与估值）。
+                    #   511090/511130/511220 上交所PCF逐券估值（2026-11-14 新增：
+                    #     公告只给数量，逐券价格由货币网现券/TL期货补齐；算法见
+                    #     core/bond_sse_pcf_valuation.py）。
+                    #   国债指数 000012 走 idx_provider（s_sh000012，已实测），
+                    #   活跃10Y国债期货仅作 511520 取数失败时的旧口径兜底（模块内新浪抓取）。
                     #   est=日内预估净值（≠最新已公布净值），idx_chg=对应方向信号（511880 货币型留空）。
                     _tz = self.idx_provider.get_change("000012")
                     _tz_pct = _tz["pct"] if _tz else None
-                    _tf_pct, _, _tf_px = get_treasury_futures_quote()
-                    _b = estimate_bond_nav(code, _tz_pct, _tf_pct)
-                    est = _b["est"] if _b["est"] is not None else _nav
+                    # 511520 已改为 PCF 逐券估值（货币网/富国官网），不再依赖期货行情：
+                    #   先不带期货信号调用；若返回不是 PCF 口径（说明 PCF 取数失败、
+                    #   已退化为旧的「票息+方向」兜底），再补拉期货信号重算一次。
+                    _b = estimate_bond_nav(code, _tz_pct, None)
+                    _tf_px = None
+                    # 🔴 2026-11-21 修（周末债券模块冷启动 3~4 分钟的元凶）：
+                    #   原判断 `if not method.startswith("pcf")` 太宽 —— 现在 16 只里
+                    #   只有 511360/511520 是 pcf 口径，其余 14 只（peers_implied /
+                    #   cb_* / sse_pcf_*）也会被判为"需要补拉期货重算"，于是每只都
+                    #   再调一次 estimate_bond_nav（重走 peers 询价 / 中证长历史 /
+                    #   东财分页净值），串行累加把 build 拖到 3 分钟+，前端冷启动白屏。
+                    #   实测这 14 只带不带 futures_pct 的 est **完全相同**（期货信号
+                    #   只在 511520 旧口径 `coupon+*` 里参与计算）。
+                    #   ⇒ 收窄为「仅 511520 退化为旧口径时才补拉重算」，其余只调一次。
+                    _bm = str(_b.get("method") or "")
+                    if _bm.startswith("coupon+"):
+                        _tf = get_treasury_futures_quote()
+                        if _tf and _tf[0] is not None:
+                            _b = estimate_bond_nav(code, _tz_pct, _tf[0])
+                            _tf_px = _tf[2]
+                    # 🔴 2026-11-17：**已接入真实估值**的这批标的（现金债 9 只 +
+                    #   可转债 2 只）一律**不允许**兜底成最新净值。
+                    #   · 信用债 ETF 日波动 1~2bp，兜底后溢价被算成 0；
+                    #   · 可转债 ETF 日波动 1~3%（比信用债大 50~100 倍），把昨日
+                    #     净值冒充今日估值会让溢价/折价指标彻底失真，比留空更误导。
+                    #   它们取数失败时 estimate_*_nav 已返回 est=None 且
+                    #   method='*_unavailable'，这里必须尊重该信号。
+                    _aid = str(_b.get("algo_id") or "")
+                    _no_fallback = (_aid.startswith("cash_bond_etf")
+                                    or _aid.startswith("cb_etf_"))
+                    if _no_fallback:
+                        est = _b["est"]          # 失败就是 None，绝不退到 _nav
+                    else:
+                        est = _b["est"] if _b["est"] is not None else _nav
                     row["idx_chg"] = _b["idx_chg"]
                     if _b.get("index_nm"):
                         row["index_nm"] = _b["index_nm"]
@@ -780,18 +832,22 @@ class ETFMarketBoard:
                         row["nav"] = _b["latest_nav"]
                         row["nav_date"] = _b.get("nav_date")
                         row["nav_src"] = "jj_realtime"
-                    # 「指数价」列：511360=国债指数000012实时点位；511520=活跃10Y国债期货最新价
-                    #   （动态合约，非硬编码T2609）。
+                    # 「指数价」列：511360=国债指数000012实时点位；
+                    #   511520=跟踪标的【国开10Y活跃利率债】的成交净价（2026-11-13 起，
+                    #   原为活跃10Y国债期货最新价；数据由 bond_pcf_valuation 一并返回）。
                     #   🔴 旧逻辑用 `"T2609" in method` 判断，但 method 字段早已不含该字面量
                     #      （09-30 改动态换月，见 bond_etf_valuation），致 511520 永远退化成国债指数价
                     #      （与511360撞车，东哥 10-04 抓出）。改判 `_tf_px is not None`。
                     #   🔴🔴 东哥 10-04 再纠正：511520 跟踪的是 10Y 国债期货，国债指数是完全不同的标的，
                     #      绝不可在「取不到期货价」时退化显示国债指数价（会误导为同一标的）。
-                    #      取不到期货价 ⇒ 显式标记 "失败"（前端红字），不做任何伪装。
+                    #      取不到 ⇒ 显式标记 "失败"（前端红字），不做任何伪装。
+                    #   🔴 2026-11-13 东哥改口：跟踪标的改为国开10Y活跃利率债，
+                    #      指数价/指数涨幅直接用活跃券净价与涨幅（仅作参考，不参与估值）。
                     if code == "511360":
                         row["idx_price"] = _tz.get("price") if _tz else None
                     elif code == "511520":
-                        row["idx_price"] = _tf_px if _tf_px is not None else "失败"
+                        _apx = _b.get("idx_price")
+                        row["idx_price"] = _apx if _apx is not None else "失败"
                     # 静态估值（债券口径）：nav(D-1)+票息+方向(D)，回溯核对公布净值。
                     #   与 LOF 的 static_val 引擎同哲学，算法=本债券模型自身（详 bond 模块）。
                     try:

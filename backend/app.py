@@ -1173,8 +1173,8 @@ class Handler(SimpleHTTPRequestHandler):
         market = (q.get("market", ["A"])[0] or "A").strip().upper()
         # 🔴 F=商品期货（东哥 10-09 拍板）：161226 白银 LOF / 159985 豆粕ETF / 159981 能源化工ETF。
         #    与 G（黄金原油）的界线 = **境内 vs 境外**：G 是境外油气黄金，F 是境内（上期/大商所/郑商所）商品期货。
-        if market not in ("A", "E", "L", "C", "G", "F", "WATCH"):
-            self._json(400, {"error": "market 只能是 A（亚洲）/ E（欧美）/ L（境内LOF）/ C（现金管理）/ G（黄金原油）/ F（商品期货）/ WATCH（关注池）"})
+        if market not in ("A", "E", "L", "B", "C", "G", "F", "WATCH"):
+            self._json(400, {"error": "market 只能是 A（亚洲）/ E（欧美）/ L（境内LOF）/ B（债券）/ C（现金管理）/ G（黄金原油）/ F（商品期货）/ WATCH（关注池）"})
             return
         # 显示ETF / 显示LOF 复选框（前端「类型」过滤）
         fund_type = (q.get("type", [""])[0] or "").strip().upper()
@@ -1233,8 +1233,9 @@ class Handler(SimpleHTTPRequestHandler):
         # 主看板 A 权重最高（每轮重建两次），覆盖全部交互视图（含类型过滤子集）
         # 🔴 2026-10-09 东哥拍板加 F（商品期货）：161226 白银走 lofarb_bridge 引用 LOFarb
         #   估值，F 市场仅 1 只、装配秒级（bridge 30s 缓存），但若不预热则 F 首屏冷加载会卡。
+        #   2026-11-17 东哥拆「债券」模块：加 ("B", None)，16 只债券 ETF 首屏同样秒回。
         order = [("A", None), ("E", None), ("G", None), ("A", "ETF"), ("L", None),
-                 ("A", "LOF"), ("C", None), ("F", None), ("A", None)]
+                 ("A", "LOF"), ("B", None), ("C", None), ("F", None), ("A", None)]
         i = 0
         while True:
             m, ft = order[i % len(order)]
@@ -1979,7 +1980,7 @@ def _daily_collect_loop():
                         # fetch_nav_history 内部按 in_arbtest 分区写红线二次兜底。
                         _rows = _conn2.execute(
                             "SELECT fund_code, idx_code FROM fund_profile "
-                            "WHERE fund_type='LOF' OR jsl_market='C' "
+                            "WHERE fund_type='LOF' OR jsl_market IN ('B','C') "
                             "OR (jsl_market IN ('E','A') AND (in_arbtest IS NULL OR in_arbtest!=1) "
                             "AND idx_code IS NOT NULL AND idx_code!='')").fetchall()
                         _conn2.close()
@@ -1991,7 +1992,7 @@ def _daily_collect_loop():
                             _sb.ensure_hk_daily(DB_PATH)
                         except Exception as e:
                             _logf("沙特 02830 日K 刷新失败: " + str(e))
-                        _logf("静态估值数据已刷新: %d 只（LOF/C + E/A 非woody ETF）" % len(_rows))
+                        _logf("静态估值数据已刷新: %d 只（LOF/B/C + E/A 非woody ETF）" % len(_rows))
                     except Exception as e:
                         _logf("静态估值数据刷新失败: " + str(e))
                 # 每日首次（含启动首轮）补跑一次篮子校准：新公告 → 前一日篮子可校准
@@ -2101,6 +2102,19 @@ def main():
     t4.start()
     _logf("场内份额直采线程已启动（每日首次从交易所直采深沪 LOF/ETF）")
 
+    # ---- 债券/现金管理 ETF 实时溢价钉钉提醒（2026-11-05 立，11-17 扩到债券B）----
+    # 独立策略文件 backend/strategy_cash_alert.py，每 5 分钟一轮，读本机
+    # /api/etf_market?market=B 与 ?market=C（即上面预热线程维护的缓存，零额外网络开销）。
+    # 开关：环境变量 ETFARB_CASH_ALERT=0 关闭。
+    # 🔴 策略自身异常绝不冒泡到主进程（start_background 内部已全部兜住）。
+    if os.environ.get("ETFARB_CASH_ALERT", "1") != "0":
+        try:
+            import strategy_cash_alert as _sca
+            _sca.start_background(interval=_sca.INTERVAL, prefer_api=True)
+            _logf("现金管理溢价提醒策略已启动（每 %d 秒一轮）" % _sca.INTERVAL)
+        except Exception as _e:
+            _logf("现金管理溢价提醒策略启动失败（不影响看板）: " + str(_e))
+
     # 启动 HTTP 服务
     port = DEFAULT_PORT
     if len(sys.argv) > 1:
@@ -2114,13 +2128,43 @@ def main():
     print("  Log     : %s" % SERVER_LOG)
     print("  Ctrl+C  : Stop")
     print("=" * 50)
-    
+
+    # 🔴 端口占用必须显式报出来（2026-11-13 踩坑）：
+    #   原先直接 ThreadingHTTPServer(...) 抛 OSError，异常从 main() 冒出后
+    #   控制台/日志里**什么都看不到**，只有退出码 1 —— 看板是无人值守跑的，
+    #   这种「静默死亡」极难排查（实际就是误双击两次 bat、或旧进程没退干净）。
+    #   这里先探一次端口，占用则打印 + 写日志 + 明确提示，再退出。
+    #   ⚠️ 探测**绝不能加 SO_REUSEADDR**：Windows 上它会让 bind 在端口已被监听时
+    #      照样成功（与 Linux 语义不同），探测就永远返回"空闲"、等于没做。
+    #      也不用 SO_EXCLUSIVEADDRUSE，那会与随后的 ThreadingHTTPServer 抢绑定。
+    import socket as _sk
+    _probe = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+    try:
+        _probe.bind((bind_host, port))
+    except OSError as _e:
+        _msg = ("启动失败：端口 %d 已被占用（%s）。请先关闭已在运行的看板"
+                "（start_dashboard.bat 会自动释放该端口），或改用其他端口启动："
+                "python app.py <端口>" % (port, _e))
+        _logf("!!! " + _msg)
+        print("\n[ERROR] " + _msg)
+        sys.exit(2)
+    finally:
+        _probe.close()
+
     try:
         server = ThreadingHTTPServer((bind_host, port), Handler)
+        _logf("HTTP 服务已监听 %s:%d" % (bind_host, port))
         server.serve_forever()
     except KeyboardInterrupt:
         _logf("ETFarb 已停止")
         print("\nETFarb 已停止")
+    except Exception as _e:
+        # 兜底：serve_forever 阶段的意外异常也要留痕，不能静默退出
+        _logf("!!! HTTP 服务异常退出: %s: %s" % (type(_e).__name__, _e))
+        print("\n[ERROR] HTTP 服务异常退出: %s: %s" % (type(_e).__name__, _e))
+        raise
+    finally:
+        _logf("ETFarb 服务进程结束")
 
 
 if __name__ == "__main__":

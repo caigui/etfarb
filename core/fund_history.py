@@ -271,9 +271,134 @@ def _history_lof(code, days, refresh, db):
     return list(reversed(out))[-days:]
 
 
-_CASH_DESC = ("债券型：静态估值(D) = 前一日净值 + 日票息 + 方向项(D)。"
-              "511880=日均增长法；511360=票息+国债指数000012×0.07；"
-              "511520=票息+T2609期货（缺失日退化国债指数代理）。")
+# ── 2026-11-14 更新：历史记录页记录 511360 / 511520 更新后的估值算法 ──────────
+def _cash_algo(code):
+    """历史页头部下发的「当前估值算法」元信息（与实时入口同源）。"""
+    try:
+        # 2026-11-17 晚：9 只现金管理 ETF 的估值已接入（中证指数日涨跌锚定）。
+        #   必须放在 511360/511520 之前判：这批代码不在 BOND_ETF_META 里，
+        #   若掉到函数末尾的 bond_legacy「日均增长法」，会让人误以为它们
+        #   用货币型的算法在算。
+        if code in _CASH_BOND_ETF_CODES:
+            import bond_cash_etf_valuation as _cbe
+            return {"id": _cbe.ALGO_ID, "name": _cbe.ALGO_NAME,
+                    "version": _cbe.ALGO_VERSION,
+                    "entry": "core/bond_cash_etf_valuation.estimate_cash_bond_nav",
+                    "desc": _cash_bond_desc(code)}
+        # 2026-11-17 晚（请求 H）：可转债 ETF 两只。
+        if code in _CB_ETF_CODES:
+            import bond_cb_etf_valuation as _cbev
+            return {"id": _cbev.ALGO_ID, "name": _cbev.ALGO_NAME,
+                    "version": _cbev.ALGO_VERSION,
+                    "entry": "core/bond_cb_etf_valuation.estimate_cb_etf_nav",
+                    "desc": _cb_etf_desc(code)}
+        # 历史遗留空壳（当前为空集）：保持原判据，防止未来又有人只入库不接算法。
+        if code in _PENDING_VAL_CODES:
+            return {"id": "pending", "name": "实时估值待接入",
+                    "version": "—", "entry": "—",
+                    "desc": ("该标的已收录到现金管理模块，实时/历史估值算法尚未接入。"
+                             "接入方式：fund_profile.val_method 由 'pending' 改为 "
+                             "'bond'，并在 core/bond_etf_valuation.BOND_ETF_META "
+                             "登记算法入口。")}
+        if code == '511360':
+            import bond_511360_valuation as _b360
+            return {"id": _b360.ALGO_ID, "name": _b360.ALGO_NAME,
+                    "version": _b360.ALGO_VERSION, "entry": _b360.ALGO_ENTRY,
+                    "desc": _b360.algorithm_desc()}
+        if code == '511520':
+            import bond_pcf_valuation as _bpv
+            return {"id": _bpv.ALGO_ID, "name": _bpv.ALGO_NAME,
+                    "version": _bpv.ALGO_VERSION,
+                    "entry": "core/bond_pcf_valuation.estimate_511520_nav",
+                    "desc": ("PCF 逐券篮子：替代金额=成份券全价。逐券价格优先级："
+                             "① 当日有成交 → PCF全价+货币网真实成交净价跨日变动（零推算）；"
+                             "② 无成交额 → 国开10Y活跃利率债Δy×该券修正久期；"
+                             "③ 皆无 → CFETS逐券估值/曲线Δy。逐券反推票息计 carry；"
+                             "债券99.52% + 一日逆回购0.48%(GC001)。盘后/周末价格效应"
+                             "归零仍按票息+回购息计算，纯计算不冻结官方净值、不做校准拟合。")}
+        if code in ('511090', '511130', '511220'):
+            import bond_sse_pcf_valuation as _sse
+            return {"id": _sse.ALGO_ID, "name": "上交所PCF逐券估值",
+                    "version": _sse.ALGO_VERSION,
+                    "entry": "core/bond_sse_pcf_valuation.estimate_sse_bond_nav",
+                    "desc": ("上交所申赎清单公告只给数量不给替代金额 ⇒ 逐券价格由"
+                             "货币网现券成交补齐：30Y特别国债按名称映射取Δy×组合久期，"
+                             "成交稀疏时用 30Y国债期货TL 涨跌兜底；城投债ETF成份为"
+                             "交易所券，用银行间城投/中票 Δy 中位数作同向代理 + 组合票息。"
+                             "锚定最新官方净值只叠加增量，行情不新于净值日时显示锚点净值，"
+                             "纯计算不拟合。回测 2026-11-13：511220 误差 +0.4bp。"
+                             "历史页：30Y用TL日K代理方向，城投债按纯票息复算。")}
+    except Exception:
+        pass
+    return {"id": "bond_legacy", "name": "日均增长法 / 票息+方向",
+            "version": "—", "entry": "core/bond_etf_valuation.static_history_bond",
+            "desc": "现金管理货币型沿用日均增长法。"}
+
+
+def _cb_etf_desc(code):
+    """可转债 ETF 的算法说明（历史页/弹窗共用）。"""
+    if code == "511380":
+        return ("驱动 = 中证可转债及可交换债券指数(931078) 的官方日涨跌 × "
+                "滚动 beta(40 个交易日回归，当前≈0.99)。"
+                "est = nav(T-1)×(1+beta×指数涨幅%)。"
+                "**无票息项** —— 可转债利息已计入转债全价，不存在信用债那种 carry。"
+                "实测样本外精度（54 个交易日）：|误差| 中位 1.2bp、RMSE 1.8bp、max 4.4bp，"
+                "可当精确估值用。"
+                "为何不走逐券：可转债在交易所确有连续成交（盘中成交额可达数亿元），"
+                "但上交所 PCF 只给**数量**不给替代金额，qty×价格 无法还原真实权重"
+                "（实测按数量加权算出的篮子涨跌比实际净值多跌 19bp），"
+                "篮子恒等式 Σ(qty×px)/navpercu 在两只上分别是 10.414 / 10.781 —— 不是常数。"
+                "故逐券只能算方向、算不准幅度，指数法反而准 20 倍。")
+    return ("驱动 = 上证可转换债券指数(000139) 的官方日涨跌 × 滚动 beta"
+            "(40 个交易日回归，当前≈0.84)。est = nav(T-1)×(1+beta×指数涨幅%)。"
+            "⚠️ **本只精度有限，只能当参考**：实测样本外（54 个交易日）|误差| 中位 7.3bp、"
+            "RMSE 11.0bp、max 42.4bp。两个根因：① 只持 85 只（511380 持 302 只），"
+            "前几大是兴业/上银/重银等**银行转债**（低波动低 beta），个券集中度高；"
+            "② beta 在漂移，4 个月内从 0.686 单调升到 0.817，滚动回归只能追不能预判。"
+            "因此不要把它的估值当精确净值用，看方向与量级即可。"
+            "（为何不走逐券：同 511380，PCF 缺替代金额，qty×价格 权重不可靠。）")
+
+
+def _cash_desc(code):
+    algo = _cash_algo(code)
+    common = ("静态估值(D) = 公布 Nav(D) 之前的模型预估，随后与实际 Nav 核对；"
+              "每行「估值算法」列记录该行实际使用的算法与数据来源，"
+              "「估值误差/误差率」= 静态估值 − 实际净值。")
+    if code == '511360':
+        body = ("511360【已更新 {}，{}】：海富通官网 PCF 逐券篮子（方法二）"
+                "——替代金额/(数量×10)=成份券全价，逐券 ΔP=−久期×Δy(成交bp中位数×0.9)"
+                "+逐券票息；按三季报债券82.80%/买入返售17.16%(FR007)/其他0.04% 折算，"
+                "锚定最新官方净值只取篮子相对变动。历史日按同方法 Δy=0 的纯票息口径复算；"
+                "国债指数000012 仅作展示列，不参与估值。"
+                .format(algo["id"], algo["version"]))
+    elif code in _CASH_BOND_ETF_CODES:
+        body = "【已更新 {}，{}】{}".format(algo["id"], algo["version"],
+                                        _cash_bond_desc(code))
+    elif code in _CB_ETF_CODES:
+        body = "【已更新 {}，{}】{}".format(algo["id"], algo["version"],
+                                        _cb_etf_desc(code))
+    elif code in ('511090', '511130', '511220'):
+        nm = {'511090': '511090 30年国债ETF鹏扬', '511130': '511130 30年国债ETF博时',
+              '511220': '511220 城投债ETF海富通'}[code]
+        body = ("{}【已更新 {}，{}】：上交所 PCF 公告（TradingDay=T 用 T-1 官方净值"
+                "作锚点）+ 货币网现券成交补齐逐券价格。30Y 国债：成份券 Δy(活跃券)×"
+                "组合修正久期，成交稀疏时用 TL 期货涨跌兜底；城投债：银行间城投/中票 "
+                "Δy 中位数作同向代理 + 组合票息。行情不新于净值日时显示锚点净值，"
+                "纯计算不拟合。历史页：30Y 用 TL 日K代理方向，城投债按纯票息复算。"
+                .format(nm, algo["id"], algo["version"]))
+    elif code == '511520':
+        body = ("511520【已更新 {}，{}】：富国官网 PCF 逐券篮子为准"
+                "——「替代金额」= 每只成份券全价（含应计）。逐券价格优先级："
+                "① 当日有成交 → PCF 全价 + 货币网真实成交净价的跨日变动（零推算）；"
+                "② 当日**无成交额** → 国开10Y活跃利率债 Δy × 该券修正久期（平行移动假设）；"
+                "③ 两者皆无 → CFETS 逐券估值全价 / 曲线Δy。"
+                "逐券反推票息计 carry；债券99.52% + 一日逆回购0.48%(GC001)。"
+                "历史页按同一算法优先级复算：CFETS估值 > PCF逐日快照真实全价 > "
+                "逐券carry+方向代理。纯计算，不冻结官方净值、不做校准拟合。"
+                .format(algo["id"], algo["version"]))
+    else:
+        body = "511880/511990 货币型：近20日日均增量 × 计息天数（含周末）。"
+    return body + "  " + common
 _LOF_DESC = ("静态估值 = 前一日净值 × (1 + 0.95 × 指数涨幅)。"
              "它是基金公司公布净值**之前**的预估 —— 用它和随后公布的 Nav 核对答案，"
              "「误差」越小说明估值算法越准。")
@@ -281,16 +406,97 @@ _SAUDI_DESC = ("沙特双雄：静态估值 = 前一日净值 × 02830 港股涨
                "两只基金 100% 持有港股 02830（南方东英沙特阿拉伯ETF），"
                "故用其港股收盘价 × 港币中间价还原净值 —— 与官方口径同源，误差远小于纯指数法。")
 
+# 🔴 2026-11-17 晚：9 只现金管理「交易所信用债 ETF」——估值已接入。
+#   历史页与实时入口同源：驱动 = 中证指数官方日涨跌（财富指数，涨幅已含票息）。
+_CASH_BOND_ETF_CODES = {
+    "511070", "511110", "511190", "511200",      # 沪市 基准做市公司债（950245）
+    "551900", "551500", "551550", "159600",      # 沪/深 科创债（932158）
+    "551030",                                    # 沪市 AAA 科创债（932160）
+}
+
+# 历史遗留空壳（当前**为空集**）：仅保留兜底，防止未来又只入库不接算法。
+#   2026-11-17 这批 9 只已从本集合移出、改由 _CASH_BOND_ETF_CODES 接管。
+_PENDING_VAL_CODES = set()
+
+# 🔴 2026-11-17 晚（请求 H）：可转债 ETF —— 估值已接入。
+#   与上面 9 只信用债 ETF 的差异：可转债在交易所**有连续成交**，但 PCF 只给数量
+#   不给替代金额（实测 qty×价格 推权重差 19~26bp，比指数法差 4~20 倍），
+#   故仍用「转债指数日涨跌 × 滚动 beta」。
+_CB_ETF_CODES = {"511380", "511180"}
+
+# 「参考指数」列的展示名（只标注，不参与计算）
+CASH_BOND_ETF_IDX_NM = {
+    "511070": "上证基准做市公司债指数(950245)",
+    "511110": "上证基准做市公司债指数(950245)",
+    "511190": "上证基准做市公司债指数(950245)",
+    "511200": "上证基准做市公司债指数(950245)",
+    "551900": "中证科技创新公司债指数(932158)",
+    "551500": "中证科技创新公司债指数(932158)",
+    "551550": "中证科技创新公司债指数(932158)",
+    "159600": "中证科技创新公司债指数(932158)",
+    "551030": "中证AAA科技创新公司债指数(932160)",
+}
+
+
+def _cash_bond_desc(code):
+    """这 9 只的算法说明（历史页/弹窗共用）。"""
+    try:
+        import bond_cash_etf_valuation as _cbe
+        m = _cbe.CASH_BOND_ETF_META.get(code) or {}
+    except Exception:
+        m = {}
+    idx, idxn = m.get("idx"), m.get("idx_name")
+    proxy = m.get("idx_proxy")
+    tail = ("本只跟踪的 %s 无同指数兄弟 ETF，收盘后用同族指数 %s 代理"
+            "（两指数日涨跌差 |中位| 0.00bp、max 1.00bp）。" % (idx, proxy)
+            if proxy else "")
+    return (
+        "驱动 = 中证指数官网 " + str(idx) + "（" + str(idxn) + "）的官方日涨跌。"
+        "est = nav(T-1)×(1+指数涨幅)，**不叠加票息** —— 该指数是财富指数口径，"
+        "涨幅本身已含当日票息，叠加会重复计息（实测 +1.0~1.9bp 单向高估）。"
+        "盘中指数尚未发布时，用同指数兄弟 ETF 的盘中涨跌中位数粗估"
+        "（P90 误差 25~36bp），收盘后自动切回指数精确口径。"
+        "分红日按累计净值剔除派现后复算，不把除权当暴跌。"
+        "实测精度（19 个交易日，vs 累计净值涨跌）：|误差| 中位 0.3~0.8bp、max 3.6bp。"
+        "为何不走逐券：这批成份券是**交易所**信用债 —— 交易所行情恒为 0.000（无连续成交）、"
+        "CFETS 估值表只覆盖政金债/国债（对 313 只成份券命中 0%）、"
+        "货币网是银行间市场（名称命中 0 条且方向相反）。" + tail)
+
 
 def get_history(code, days=60, refresh=False, db=None):
     """统一入口。返回 {code, name, kind: 'cash'|'lof', desc, profile, rows}。"""
     p = _profile(code, db) or {}
-    if (p.get("val_method") == "bond") and code in _bv.BOND_ETF_META:
-        rows = _bv.static_history_bond(code, days=days, db=db, refresh=refresh)
+    if p.get("val_method") == "pending" or code in _PENDING_VAL_CODES:
+        # 已收录但算法未接入：返回空 rows + 明确原因，不拿 LOF 的「净值×指数涨幅」
+        # 或货币型的「日均增长」凑一个看起来像估值的数。
+        algo = _cash_algo(code)
         return {"code": code, "name": p.get("fund_name") or "", "kind": "cash",
-                "desc": _CASH_DESC,
-                "profile": {"index_nm": None, "sub_fee": p.get("apply_fee"),
-                            "redeem_fee": p.get("redeem_fee")},
+                "desc": algo["desc"], "algo": algo,
+                "profile": {"index_nm": p.get("jsl_index_nm"),
+                            "sub_fee": p.get("apply_fee"),
+                            "redeem_fee": p.get("redeem_fee"),
+                            "val_algo": algo["name"], "val_algo_id": algo["id"]},
+                "rows": []}
+    # 🔴 2026-11-17 晚：9 只现金管理交易所信用债 ETF 走这里。
+    #   它们**不在** BOND_ETF_META 里（估值入口是独立模块），但历史口径同属
+    #   「债券型静态估值」，由 static_history_bond 内部按 _CASH_BOND_ETF_CODES 分流。
+    if (p.get("val_method") == "bond"
+            and (code in _bv.BOND_ETF_META or code in _CASH_BOND_ETF_CODES
+                 or code in _CB_ETF_CODES)):
+        rows = _bv.static_history_bond(code, days=days, db=db, refresh=refresh)
+        algo = _cash_algo(code)
+        if code in _CASH_BOND_ETF_CODES:
+            _idxnm = CASH_BOND_ETF_IDX_NM.get(code)
+        elif code in _CB_ETF_CODES:
+            _idxnm = _bv.CB_ETF_META_IDX.get(code)
+        else:
+            _idxnm = None
+        return {"code": code, "name": p.get("fund_name") or "", "kind": "cash",
+                "desc": _cash_desc(code), "algo": algo,
+                "profile": {"index_nm": _idxnm,
+                            "sub_fee": p.get("apply_fee"),
+                            "redeem_fee": p.get("redeem_fee"),
+                            "val_algo": algo["name"], "val_algo_id": algo["id"]},
                 "rows": rows}
     rows = _history_lof(code, days, refresh, db)
     uses_lcu = any(r.get("drv_close") is not None for r in rows) and code == '159687'

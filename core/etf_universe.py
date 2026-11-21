@@ -93,7 +93,10 @@ VIRTUAL_CASH_CODE = "159900"
 
 # 迁移：LOF / 现金管理 类别 → jsl_market（与 ETF 共用 'A' 实现「亚洲 Tab 混合展示」）
 _LOF_UNIVERSE = "lof_universe.tsv"
-_LOF_CAT_TO_MARKET = {"国内LOF": "L", "QDII亚洲": "A", "现金管理": "C"}
+# 🔴 2026-11-17：新增「债券」→ B（东哥把现金管理里 16 只债券 ETF 拆到独立债券模块）。
+#    现金管理 C 现仅剩 2 只货币 ETF（511880/511990）；category 与 jsl_market 一一对应，
+#    否则本函数重跑时会把债券 ETF 的 category='债券' 误映射回 L。
+_LOF_CAT_TO_MARKET = {"国内LOF": "L", "QDII亚洲": "A", "现金管理": "C", "债券": "B"}
 
 
 def _conn():

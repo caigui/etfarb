@@ -137,16 +137,21 @@ def classify(code):
 
     规则（与沪深代码段一致，注意先判 LOF 再判 ETF，因 502 属 LOF 而 520/526 属 ETF）：
       · 501/502/506  → sh_lof    （沪市 LOF）
-      · 51/52/56/58  → sh_etf    （沪市 ETF：510/511/512/513/515/516/518/520/526/560/561/562/563/588/589…）
+      · 51/52/55/56/58 → sh_etf  （沪市 ETF：510/511/512/513/515/516/518/520/526/551/560/561/562/563/588/589…）
       · 158/159      → sz_etf    （深市 ETF）
       · 16xxxx       → sz_lof    （深市 LOF）
+
+    🔴 2026-11-17：补 `55` 段 —— 此前漏了，「科创债 ETF」551030/551500/551550/551900
+       四只一直返回 None 被 collect() 静默丢弃，份额历史行数恒为 0，看板「规模」列空白。
+       实测腾讯 field[72] 对 551xxx 正常返回（18779 / 20402 / 21530.82 / 13003.17 万份），
+       故只需把代码段补齐，取数链路本身无需改动。
     """
     c = str(code).strip()
     if len(c) != 6 or not c.isdigit():
         return None
     if c[:3] in ("501", "502", "506"):
         return "sh_lof"
-    if c[:2] in ("51", "52", "56", "58"):
+    if c[:2] in ("51", "52", "55", "56", "58"):
         return "sh_etf"
     if c[:3] in ("158", "159"):
         return "sz_etf"
@@ -649,7 +654,8 @@ class ShareDirectFetcher:
             out.append("   %s  %4d 行  %3d 只" % (r[0], r[1], r[2]))
         out.append("")
         out.append("按市场（最新一行是否含份额 / 新增）")
-        for mk in ("A", "E", "L", "C", "WATCH"):
+        # 2026-11-17：加 B（债券，16 只从 C 拆出），否则覆盖报告里看不到债券市场。
+        for mk in ("A", "E", "L", "B", "C", "WATCH"):
             rows = list(c.execute("""
                 SELECT p.fund_code,
                        (SELECT shares FROM unified_fund_history f WHERE f.fund_code=p.fund_code
