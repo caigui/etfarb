@@ -120,6 +120,15 @@ CTRL_WATCH = {
     "511220": {"name": "城投债ETF海富通", "mode": "below", "th_bp": -40.0},
 }
 
+# 🔴 2026-11-21 新增：三只现金管理工具的「折溢价套利可行性」判定
+#   由 backend/cash_arb_advisor.py 实现：考虑节假日/周几导致的资金占用天数、
+#   与 GC001 逆回购收益对比、溢价 1.5× 安全垫、到账时间与申赎额度。
+ARB_CODES = ("511880", "511990", "511360")
+try:
+    import cash_arb_advisor as _arb
+except Exception:                  # 套利模块故障不阻断既有提醒
+    _arb = None
+
 # 🔴 极端波动提醒（2026-11-14）：当日实时波动 > 3 × 当年平均日波动 → 触发
 #   当日实时波动 = |实时估值(iopv) ÷ 前一日净值(nav) − 1|
 #   当年平均波动 = 当年日净值变动绝对值的平均（东财 lsjz，≥20 个样本才启用）
@@ -429,9 +438,37 @@ def judge_extreme(rows):
     return ext_items, ext_hits
 
 
+# ============ 折溢价套利可行性（2026-11-21 新增） ============
+def judge_arb(rows):
+    """用 cash_arb_advisor 分析三只现金管理工具的折溢价套利机会。
+
+    返回 (res, arb_hits)：
+      res      : 完整分析结果（供 markdown 渲染，含占用天数/到账时间/额度）
+      arb_hits : 有可行套利机会的标的 [{code,name,kind,...}]，用于并入触发集合
+    任一异常都吞掉并返回空，绝不影响既有提醒。
+    """
+    if _arb is None:
+        return None, []
+    try:
+        res = _arb.analyze(rows)
+    except Exception as e:
+        _logf("套利分析失败（不影响既有提醒）：%s" % e)
+        return None, []
+    hits = []
+    for code, it in res.get("items", {}).items():
+        kinds = []
+        if it["discount"]["feasible"]:
+            kinds.append("折价%.2fbp→赎回" % it["discount"]["discount_bp"])
+        if it["premium"]["feasible"]:
+            kinds.append("溢价%.2fbp→申购" % it["premium"]["premium_bp"])
+        if kinds:
+            hits.append({"code": code, "name": it["name"], "kind": "/".join(kinds)})
+    return res, hits
+
+
 # ============ 消息拼装 ============
-def build_markdown(items, hits, source="api", ext_items=None):
-    """拼钉钉 markdown。表格 = 全部监控标的（命中行带 🔴），下方附赎回到账备忘。"""
+def build_markdown(items, hits, source="api", ext_items=None, arb_res=None):
+    """拼钉钉 markdown。表格 = 全部监控标的（命中行带 🔴），下方附套利机会与到账备忘。"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # 触发数 = 溢价命中 + 极端波动命中（ext_items 是全量明细，不能直接 len）
     ext_all = ext_items or []
@@ -440,10 +477,16 @@ def build_markdown(items, hits, source="api", ext_items=None):
         it.get("code") == x.get("code") for x in items)])
     head = ("### %s\n\n> %s · 触发 **%d** / 监控 **%d** 只 · 数据源 %s\n"
             "> 阈值：511880/511990 溢价 ±0.5bp，511360 溢价 ±1bp，511520 溢价 <0bp，"
-            "511220 贴水 >40bp；极端波动(7只) > 3×当年平均日波动\n\n"
-            "| 信号 | 代码 | 名称 | 现价 | 实时估值 | 实时溢价 | 基金净值 | 净值日期 |\n"
-            "|---|---|---|---|---|---|---|---|\n"
+            "511220 贴水 >40bp；极端波动(7只) > 3×当年平均日波动；"
+            "套利：折价需跑赢GC001、溢价≥逆回购×1.5(详见下方)\n\n"
+            "| 信号 | 代码 | 名称 | 现价 | 实时估值 | 实时溢价 | 基金净值 | 净值日期 | 操作方式 | 最小申赎 |\n"
+            "|---|---|---|---|---|---|---|---|---|---|\n"
             % (TITLE, now, len(hits) + ext_nd, mon_groups, source))
+
+    # 套利结果按代码索引，供表格「操作方式 / 最小申赎」两列取数
+    arb_items = {}
+    if arb_res and _arb is not None:
+        arb_items = {c: v for c, v in (arb_res.get("items") or {}).items()}
 
     body = []
     for it in items:
@@ -452,10 +495,22 @@ def build_markdown(items, hits, source="api", ext_items=None):
                 else "%+.4f%% (%s)" % (it["prem_pct"], _fmt_bp(it["prem_bp"])))
         if it["hit"]:
             prem = "**%s**" % prem
-        body.append("| %s | %s | %s | %s | %s | %s | %s | %s |"
+        # 操作方式 / 最小申赎（仅三只现金工具有申赎套利规则，其余标的显示 —）
+        ai = arb_items.get(it["code"])
+        if ai:
+            action = ai.get("action", "观望")
+            if action in ("赎回", "申购"):
+                action_cell = "**%s**" % action      # 有可行套利 → 加粗提示
+            else:
+                action_cell = action
+            ma = ai.get("min_apply") or {}
+            min_cell = "%s份/%s" % (ma.get("shares"), ma.get("amount"))
+        else:
+            action_cell, min_cell = "—", "—"
+        body.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |"
                     % (flag, it["code"], it["name"], _fmt(it["price"], 3),
                        _fmt(it["iopv"], 4), prem, _fmt(it["nav"], 4),
-                       it["nav_date"] or "—"))
+                       it["nav_date"] or "—", action_cell, min_cell))
 
     # 判定明细（把命中原因写清楚，避免只看到一个红点不知道触发了什么）
     detail = "\n\n**判定明细**\n\n"
@@ -485,7 +540,15 @@ def build_markdown(items, hits, source="api", ext_items=None):
     for code, text in NOTES:
         note += "- **%s**：%s\n" % (code, text)
 
-    return head + "\n".join(body) + detail + note
+    # 🔴 2026-11-21：折溢价套利机会板块（含操作方式/到账时间/额度）
+    arb_block = ""
+    if arb_res and _arb is not None:
+        try:
+            arb_block = "\n\n" + _arb.format_arb_markdown(arb_res)
+        except Exception as e:
+            arb_block = "\n\n> 套利板块渲染失败：%s\n" % e
+
+    return head + "\n".join(body) + detail + arb_block + note
 
 
 # ============ 单轮 ============
@@ -508,41 +571,43 @@ def run_once(dry_run=False, ignore_session=False, always=False, prefer_api=True)
 
     items, hits = judge(rows)
     ext_items, ext_hits = judge_extreme(rows)
+    arb_res, arb_hits = judge_arb(rows)
     msg = build_markdown(items, hits, source="本机API" if source == "api" else "直算",
-                         ext_items=ext_items)
+                         ext_items=ext_items, arb_res=arb_res)
 
+    n_total = len(hits) + len(ext_hits) + len(arb_hits)
     if dry_run:
         print("\n" + "=" * 70)
         print(msg)
         print("=" * 70 + "\n")
-        _logf("dry-run：触发 %d 只（溢价 %d / 极端波动 %d），消息已打印未发送"
-              % (len(hits) + len(ext_hits), len(hits), len(ext_hits)))
-        return {"ok": True, "sent": False, "hits": len(hits) + len(ext_hits),
+        _logf("dry-run：触发 %d 只（溢价 %d / 极端波动 %d / 套利 %d），消息已打印未发送"
+              % (n_total, len(hits), len(ext_hits), len(arb_hits)))
+        return {"ok": True, "sent": False, "hits": n_total,
                 "items": items, "reason": "dry-run"}
 
-    if not hits and not ext_hits and not always:
-        _logf("无触发（监控 %d 只 + 极端波动 %d 只），不发送"
-              % (len(items), len(ext_items)))
+    if not hits and not ext_hits and not arb_hits and not always:
+        _logf("无触发（监控 %d 只 + 极端波动 %d 只 + 套利 %d 只），不发送"
+              % (len(items), len(ext_items), len(arb_hits)))
         return {"ok": True, "sent": False, "hits": 0, "items": items,
                 "reason": "无触发"}
 
     bot = _notifier()
     if not bot:
-        _logf("钉钉通知器不可用，本轮消息未发送（触发 %d 只）" % (len(hits) + len(ext_hits)))
-        return {"ok": False, "sent": False, "hits": len(hits) + len(ext_hits),
+        _logf("钉钉通知器不可用，本轮消息未发送（触发 %d 只）" % n_total)
+        return {"ok": False, "sent": False, "hits": n_total,
                 "items": items, "reason": "钉钉通知器不可用"}
 
     try:
         ok = bot.send_alert(msg, TITLE)
     except Exception as e:
         _logf("钉钉发送异常：%s" % e)
-        return {"ok": False, "sent": False, "hits": len(hits) + len(ext_hits),
+        return {"ok": False, "sent": False, "hits": n_total,
                 "items": items, "reason": "发送异常: %s" % e}
 
-    n_total = len(hits) + len(ext_hits)
     desc = "、".join(
         ["%s 溢价%.2fbp" % (h["code"], h["prem_bp"]) for h in hits]
-        + ["%s 极端波动%.2fbp" % (h["code"], h["cur_bp"]) for h in ext_hits])
+        + ["%s 极端波动%.2fbp" % (h["code"], h["cur_bp"]) for h in ext_hits]
+        + ["%s 套利(%s)" % (h["code"], h["kind"]) for h in arb_hits])
     if ok:
         _logf("已发送钉钉：触发 %d 只（%s）" % (n_total, desc))
         # 🔴 极端波动去重只在真正发送成功后才记「已提醒」（发送失败不吞掉信号）
