@@ -349,12 +349,35 @@ def _num(x, default=None):
 # ---------------------------------------------------------------------------
 # 文案（供提醒 markdown 使用）
 # ---------------------------------------------------------------------------
+def format_rules_markdown(res=None):
+    """套利部分的**规则口径**文案，供 strategy_cash_alert 集中到「策略规则」板块。
+
+    这里只放规则/门槛/额度说明，不放任何触发数据，避免与机会明细重复。
+    """
+    lines = ["- **折溢价套利规则**：折价需跑赢 GC001（净收益 > %.2fbp）；"
+             "溢价 ≥ 占用期逆回购 × %.1f 倍 + 交易成本 %.2fbp（T+1/T+2 才可卖）；"
+             "不达门槛不提醒\n" % (MIN_NET_BP, PREMIUM_SAFETY, TRADE_COST_BP)]
+    if res:
+        lines.append("- **当日套利基准**：基准日 %s · GC001 年化 %.3f%%（%s）\n"
+                     % (res["as_of"], res["repo_rate"] * 100, res["repo_src"]))
+    lines.append("- **申赎额度**：%s\n" % (
+        (res or {}).get("quota_note") or
+        "东财未公开场内 ETF 实时申赎额度，请在券商 APP【场内基金 → 申购/赎回】核对。"))
+    lines.append("- **最小申赎门槛**：%s\n" % "、".join(
+        "%s %s份(≈%s)" % (c, r.get("min_apply_shares"), r.get("min_apply_amount"))
+        for c, r in ARB_RULES.items()))
+    return "".join(lines)
+
+
 def format_arb_markdown(res):
-    """把 analyze() 结果渲染成钉钉 markdown 片段（仅列有可行机会的标的）。"""
+    """把 analyze() 结果渲染成钉钉 markdown 片段（**仅列有可行机会的标的**）。
+
+    规则口径已抽到 format_rules_markdown()，本函数只输出触发数据本身。
+    """
     lines = []
     lines.append("#### 💰 折溢价套利机会（跑赢 GC001 才有意义）\n")
-    lines.append("> 基准日 %s · GC001 年化 %.3f%%（%s）· 溢价安全倍数 %.1f×\n"
-                 % (res["as_of"], res["repo_rate"] * 100, res["repo_src"], PREMIUM_SAFETY))
+    lines.append("> 基准日 %s · GC001 年化 %.3f%%（%s）\n"
+                 % (res["as_of"], res["repo_rate"] * 100, res["repo_src"]))
     any_hit = False
     for code, it in res["items"].items():
         d, p = it["discount"], it["premium"]
@@ -382,22 +405,11 @@ def format_arb_markdown(res):
                 "申购 **%s（周%s）** 可卖，之间占用 %d 自然日，注意价格回落"
                 % (p["sellable_date"], p["sellable_weekday"], p["occupy_days"])))
             lines.append("  - 操作：%s\n" % p["path"])
-        ma = it.get("min_apply") or {}
-        lines.append("  - 💵 操作方式：**%s** · 最小申赎 **%s份（%s）**\n"
-                     % (it.get("action", "观望"), ma.get("shares"), ma.get("amount")))
-        q = it["quota"]
-        qtext = ("申购状态 %s%s" % (q["status"],
-                 ("，限额 " + q["limit"]) if q["limit"] else "")) if q["known"] else "额度未获取"
-        lines.append("  - ⚠️ 额度：%s — %s\n" % (qtext, res["quota_note"]))
+        # 操作方式/最小申赎见表格「操作方式/最小申赎」列，额度说明见末尾「策略规则」，
+        # 这里只保留触发数据（收益/占用天数/到账日/操作路径），避免重复刷屏。
         lines.append("\n")
     if not any_hit:
         lines.append("> 本轮无跑赢逆回购的折溢价机会（阈值内或无数据）。\n\n")
-    # 最小申赎门槛速查（无论是否有机会都展示，方便随时核对资金门槛）
-    lines.append("> **最小申赎门槛**：")
-    lines.append("、".join("%s %s份(≈%s)" % (c, (it.get("min_apply") or {}).get("shares"),
-                                          (it.get("min_apply") or {}).get("amount"))
-                          for c, it in res["items"].items()))
-    lines.append("\n\n")
     return "".join(lines)
 
 
