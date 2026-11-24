@@ -2115,6 +2115,18 @@ def main():
         except Exception as _e:
             _logf("现金管理溢价提醒策略启动失败（不影响看板）: " + str(_e))
 
+    # ---- 场内货基溢价/年化钉钉提醒（2026-11-24 从 notice 迁入）----
+    # 独立策略 backend/strategy_money_fund_alert.py，取集思录全市场货基，
+    # 溢价≥0.003% 或 买赎/申卖年化>1.5% 触发，每交易日一次。
+    # 开关：环境变量 ETFARB_MONEY_FUND_ALERT=0 关闭。
+    if os.environ.get("ETFARB_MONEY_FUND_ALERT", "1") != "0":
+        try:
+            import strategy_money_fund_alert as _smf
+            _smf.start_background(interval=_smf.INTERVAL)
+            _logf("场内货基套利提醒策略已启动（每 %d 秒一轮）" % _smf.INTERVAL)
+        except Exception as _e:
+            _logf("场内货基套利提醒策略启动失败（不影响看板）: " + str(_e))
+
     # 启动 HTTP 服务
     port = DEFAULT_PORT
     if len(sys.argv) > 1:

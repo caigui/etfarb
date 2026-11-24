@@ -17,6 +17,37 @@ CREATE TABLE IF NOT EXISTS watch_pool (
 
 
 ================================================================
+场内货币基金 溢价/年化 钉钉提醒（backend/strategy_money_fund_alert.py）  [2026-11-24 从 notice 迁入]
+================================================================
+独立策略文件，随 backend/app.py 启动自动挂 daemon 线程，每 5 分钟一轮；
+原实现在 notice/qdii_arbitrage_alert.py::MoneyFundQueryStrategy + crawl/trade_money_fund.py，
+notice 侧已删除。迁入时改纯 requests 取数（etfarb 无 pandas）、集思录 URL 动态时间戳、
+每日一次落盘去重。
+
+【触发规则】（集思录口径，满足任一）
+  · 溢价           discount_rt_num >= 0.003%
+  · 买入赎回年化   profit_rt       >  1.5%
+  · 申购卖出年化   profit_rt2      >  1.5%
+  数据源：https://www.jisilu.cn/data/repo/trade_money_fund_list/（匿名可取）
+  字段：fund_id→代码  fund_nm→名称  discount_rt_num→溢价  profit_rt→买赎年化
+        profit_rt2→申卖年化  t2_dt→到账日  unit_total→规模(亿)
+
+【去重 / 推送】
+  · 每交易日首次触发推送一次，状态 log/strategy_money_fund_alert_state.json；
+    发送失败或 12:30–13:00 静默窗口不落标记，下一轮重试。
+  · 复用 backend/dingtalk_utils.DingTalkNotifier，推送标题「场内货基套利提示」。
+  · 只列触发标的，附触发原因 + 策略规则板块。
+
+【用法】
+  python backend/strategy_money_fund_alert.py                # 常驻，每 5 分钟
+  python backend/strategy_money_fund_alert.py --once --dry-run
+  python backend/strategy_money_fund_alert.py --once --all-hours --force
+  关闭策略：启动服务前 set ETFARB_MONEY_FUND_ALERT=0
+  日志：log/strategy_money_fund_alert.log
+  备注：年化为集思录估算值，实际以券商 APP 申赎确认与到账日为准。
+
+
+================================================================
 债券/现金管理 ETF 钉钉提醒 · 完整规则（backend/strategy_cash_alert.py）
   ⚠️ 本节 2026-11-23 二次重写：阈值改为「按波动率分档」，
      极端波动改为「p99 分位」并覆盖全部 18 只。下方原口径已过时，
